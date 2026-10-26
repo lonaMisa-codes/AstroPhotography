@@ -16,6 +16,7 @@ import android.graphics.Rect
 import android.graphics.SurfaceTexture
 import android.graphics.drawable.GradientDrawable
 import android.hardware.camera2.CameraAccessException
+import android.hardware.display.DisplayManager
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -104,6 +105,7 @@ class MainActivity : Activity() {
         const val FMT_DNG = 0
         const val FMT_JPG = 1
         const val FMT_BOTH = 2
+        const val ACCENT = 0xFF2B6CB8.toInt()
         val WB_LABELS = linkedMapOf(
             CameraMetadata.CONTROL_AWB_MODE_AUTO to "Auto",
             CameraMetadata.CONTROL_AWB_MODE_DAYLIGHT to "Daylight",
@@ -141,6 +143,10 @@ class MainActivity : Activity() {
     private var zoom = 1f
     private var sessionName = ""
     private var showHist = true
+    private var uiBtn = 60      // button size, dp
+    private var uiText = 13     // button value text, sp
+    private var uiBar = 60      // bar opacity, %
+    private var uiHist = 180    // histogram width, dp
 
     @Volatile private var chars: CameraCharacteristics? = null
     @Volatile private var camera: CameraDevice? = null
@@ -169,6 +175,22 @@ class MainActivity : Activity() {
     private lateinit var hist: HistView
     private lateinit var shutterInner: View
     private val btns = ArrayList<Btn>()
+    private lateinit var topBar: LinearLayout
+    private lateinit var bottomBar: LinearLayout
+    private lateinit var rowLayout: LinearLayout
+    private lateinit var shutterBtn: FrameLayout
+    private lateinit var panel: LinearLayout
+    private lateinit var panelTitle: TextView
+    private lateinit var panelValue: TextView
+    private lateinit var panelPills: LinearLayout
+    private lateinit var ruler: RulerView
+    private var panelKey: String? = null
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(id: Int) {}
+        override fun onDisplayRemoved(id: Int) {}
+        override fun onDisplayChanged(id: Int) { fitPreview() }
+    }
+    private var panelValueTap: (() -> Unit)? = null
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -205,12 +227,14 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager).registerDisplayListener(displayListener, main)
         if (textureView.isAvailable) openCamera()
         histLoop()
     }
 
     override fun onPause() {
         if (running) stopRun("Stopped (app paused)")
+        (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager).unregisterDisplayListener(displayListener)
         camHandler.post { closeCamera() }
         main.removeCallbacksAndMessages(null)
         super.onPause()
@@ -247,6 +271,10 @@ class MainActivity : Activity() {
         focusDiopter = prefs.getFloat("focus", 0f)
         zoom = prefs.getFloat("zoom", 1f)
         showHist = prefs.getBoolean("hist", true)
+        uiBtn = prefs.getInt("uiBtn", 60)
+        uiText = prefs.getInt("uiText", 13)
+        uiBar = prefs.getInt("uiBar", 60)
+        uiHist = prefs.getInt("uiHist", 180)
         sessionName = prefs.getString("session", null)
             ?: SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
     }
@@ -257,6 +285,7 @@ class MainActivity : Activity() {
             .putInt("delay", delaySec).putInt("frames", frames).putInt("gap", gapSec)
             .putInt("wb", wbMode).putBoolean("focusAuto", focusAuto).putFloat("focus", focusDiopter)
             .putFloat("zoom", zoom).putBoolean("hist", showHist).putString("session", sessionName)
+            .putInt("uiBtn", uiBtn).putInt("uiText", uiText).putInt("uiBar", uiBar).putInt("uiHist", uiHist)
             .putString("lens", lenses.getOrNull(lensIndex)?.let { "${it.logicalId}|${it.physicalId}" } ?: "")
             .apply()
     }
@@ -265,28 +294,36 @@ class MainActivity : Activity() {
     private inner class Btn(val label: String, val value: () -> String, val onTap: () -> Unit) {
         val view = LinearLayout(this@MainActivity)
         private val v = TextView(this@MainActivity)
+        private val l = TextView(this@MainActivity)
+        private val bg = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(0xCC333333.toInt())
+        }
 
         init {
             view.orientation = LinearLayout.VERTICAL
             view.gravity = Gravity.CENTER
-            view.background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(0xCC333333.toInt())
-            }
+            view.background = bg
             v.setTextColor(Color.WHITE)
-            v.textSize = 13f
             v.gravity = Gravity.CENTER
             v.maxLines = 1
-            val l = TextView(this@MainActivity)
             l.text = label
-            l.setTextColor(0xFFAAAAAA.toInt())
-            l.textSize = 8f
+            l.setTextColor(0xFFBBBBBB.toInt())
             l.gravity = Gravity.CENTER
+            l.maxLines = 1
             view.addView(v)
             view.addView(l)
             view.setOnClickListener { onTap() }
+            setTextSizes(13)
             refresh()
         }
+
+        fun setTextSizes(sp: Int) {
+            v.textSize = sp.toFloat()
+            l.textSize = (sp * 0.62f).coerceAtLeast(7f)
+        }
+
+        fun mark(on: Boolean) { bg.setColor(if (on) ACCENT else 0xCC333333.toInt()) }
 
         fun refresh() { v.text = value() }
     }
@@ -311,13 +348,13 @@ class MainActivity : Activity() {
             }
             override fun onSurfaceTextureUpdated(s: SurfaceTexture) {}
         }
-        root.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> fitPreview() }
+        textureView.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> fitPreview() }
 
         // top bar
         val top = LinearLayout(this)
+        topBar = top
         top.orientation = LinearLayout.HORIZONTAL
         top.gravity = Gravity.CENTER_VERTICAL
-        top.setBackgroundColor(0x55000000)
         top.setPadding(dp(28), dp(2), dp(28), dp(2))
         val title = TextView(this)
         title.text = "ASTROPHOTO\nCAMERA"
@@ -362,21 +399,22 @@ class MainActivity : Activity() {
 
         // bottom bar: buttons + shutter
         val bottom = LinearLayout(this)
+        bottomBar = bottom
         bottom.orientation = LinearLayout.HORIZONTAL
         bottom.gravity = Gravity.CENTER_VERTICAL
-        bottom.setBackgroundColor(0x99000000.toInt())
         bottom.setPadding(dp(28), dp(6), dp(28), dp(6))
 
         val scroll = HorizontalScrollView(this)
         scroll.isHorizontalScrollBarEnabled = false
         val row = LinearLayout(this)
+        rowLayout = row
         row.orientation = LinearLayout.HORIZONTAL
         scroll.addView(row)
 
         fun add(label: String, value: () -> String, tap: () -> Unit) {
             val b = Btn(label, value, tap)
             btns.add(b)
-            val lp = LinearLayout.LayoutParams(dp(54), dp(54))
+            val lp = LinearLayout.LayoutParams(dp(60), dp(60))
             lp.rightMargin = dp(8)
             row.addView(b.view, lp)
         }
@@ -385,9 +423,15 @@ class MainActivity : Activity() {
         add("TYPE", { TYPES[typeIdx].uppercase() }) { onType() }
         add("SHUTTER", { if (expNs <= 0) "AUTO" else fmtShutter(expNs) }) { onShutter() }
         add("ISO", { iso.toString() }) { onIso() }
-        add("DELAY", { "${delaySec}s" }) { pickNumber("Delay before first frame", delaySec, "Seconds") { delaySec = it; afterChange() } }
-        add("FRAMES", { if (frames == 0) "∞" else frames.toString() }) { pickNumber("Number of frames", frames, "0 = until stopped") { frames = it; afterChange() } }
-        add("GAP", { "${gapSec}s" }) { pickNumber("Pause between frames", gapSec, "Seconds") { gapSec = it; afterChange() } }
+        add("DELAY", { "${delaySec}s" }) {
+            intPanel("DELAY", "DELAY BEFORE FIRST FRAME", 300, 10, null, "s", { delaySec }) { delaySec = it }
+        }
+        add("FRAMES", { if (frames == 0) "∞" else frames.toString() }) {
+            intPanel("FRAMES", "NUMBER OF FRAMES (0 = UNTIL STOPPED)", 1000, 10, "∞", "", { frames }) { frames = it }
+        }
+        add("GAP", { "${gapSec}s" }) {
+            intPanel("GAP", "PAUSE BETWEEN FRAMES", 300, 10, null, "s", { gapSec }) { gapSec = it }
+        }
         add("WB", { WB_LABELS[wbMode]?.take(5)?.uppercase() ?: "?" }) { onWb() }
         add("FOCUS", { if (focusAuto) "AUTO" else if (focusDiopter <= 0f) "∞" else String.format(Locale.US, "%.2f", focusDiopter) }) { onFocus() }
         add("ZOOM", { String.format(Locale.US, "%.1fx", zoom) }) { onZoom() }
@@ -395,6 +439,7 @@ class MainActivity : Activity() {
         bottom.addView(scroll, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
         val shutter = FrameLayout(this)
+        shutterBtn = shutter
         shutter.background = GradientDrawable().apply {
             shape = GradientDrawable.OVAL
             setColor(Color.TRANSPARENT)
@@ -402,17 +447,202 @@ class MainActivity : Activity() {
         }
         shutterInner = View(this)
         shutterInner.background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(0xFF0A0A1E.toInt()) }
-        val ip = FrameLayout.LayoutParams(dp(46), dp(46), Gravity.CENTER)
+        val ip = FrameLayout.LayoutParams(dp(54), dp(54), Gravity.CENTER)
         shutter.addView(shutterInner, ip)
         shutter.setOnClickListener { toggleRun() }
-        val sp = LinearLayout.LayoutParams(dp(66), dp(66))
+        val sp = LinearLayout.LayoutParams(dp(74), dp(74))
         sp.leftMargin = dp(8)
         bottom.addView(shutter, sp)
 
-        root.addView(bottom, FrameLayout.LayoutParams(
+        buildPanel()
+        val stack = LinearLayout(this)
+        stack.orientation = LinearLayout.VERTICAL
+        stack.addView(panel, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        stack.addView(bottom, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(stack, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
 
         setContentView(root)
+        applyUi()
+    }
+
+    // ---------- tunable UI ----------
+    private fun applyUi() {
+        val bg = Color.argb((uiBar.coerceIn(0, 100) * 255) / 100, 0, 0, 0)
+        topBar.setBackgroundColor(bg)
+        bottomBar.setBackgroundColor(bg)
+        panel.setBackgroundColor(bg)
+        for (i in 0 until rowLayout.childCount) {
+            val v = rowLayout.getChildAt(i)
+            val lp = v.layoutParams as LinearLayout.LayoutParams
+            lp.width = dp(uiBtn)
+            lp.height = dp(uiBtn)
+            v.layoutParams = lp
+        }
+        btns.forEach { it.setTextSizes(uiText) }
+        val sl = shutterBtn.layoutParams as LinearLayout.LayoutParams
+        sl.width = dp(uiBtn + 14)
+        sl.height = dp(uiBtn + 14)
+        shutterBtn.layoutParams = sl
+        val hl = hist.layoutParams as FrameLayout.LayoutParams
+        hl.width = dp(uiHist)
+        hl.height = dp(uiHist * 2 / 5)
+        hist.layoutParams = hl
+    }
+
+    private fun uiRow(box: LinearLayout, name: String, lo: Int, hi: Int, cur: Int, unit: String, onSet: (Int) -> Unit) {
+        val tv = TextView(this)
+        tv.text = "$name: $cur$unit"
+        tv.setPadding(0, dp(10), 0, 0)
+        val sb = SeekBar(this)
+        sb.max = hi - lo
+        sb.progress = (cur - lo).coerceIn(0, hi - lo)
+        sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
+                val v = lo + p
+                tv.text = "$name: $v$unit"
+                if (fromUser) { onSet(v); applyUi() }
+            }
+            override fun onStartTrackingTouch(s: SeekBar) {}
+            override fun onStopTrackingTouch(s: SeekBar) { savePrefs() }
+        })
+        box.addView(tv)
+        box.addView(sb)
+    }
+
+    private fun showUiSettings() {
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.setPadding(dp(24), dp(8), dp(24), 0)
+        uiRow(box, "Button size", 40, 100, uiBtn, " dp") { uiBtn = it }
+        uiRow(box, "Button text size", 8, 20, uiText, " sp") { uiText = it }
+        uiRow(box, "Bar opacity", 0, 100, uiBar, " %") { uiBar = it }
+        uiRow(box, "Histogram size", 80, 400, uiHist, " dp") { uiHist = it }
+        AlertDialog.Builder(this).setTitle("Interface").setView(box)
+            .setPositiveButton("Done", null)
+            .setNeutralButton("Reset") { _, _ ->
+                uiBtn = 60; uiText = 13; uiBar = 60; uiHist = 180
+                savePrefs()
+                applyUi()
+            }.show()
+    }
+
+    // ---------- ruler panel ----------
+    private fun pill(text: String, onTap: () -> Unit): TextView {
+        val t = TextView(this)
+        t.text = text
+        t.textSize = 14f
+        t.setTextColor(Color.WHITE)
+        t.gravity = Gravity.CENTER
+        t.setPadding(dp(16), dp(8), dp(16), dp(8))
+        t.background = GradientDrawable().apply {
+            cornerRadius = dp(20).toFloat()
+            setColor(0xAA666666.toInt())
+        }
+        t.setOnClickListener { onTap() }
+        val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        lp.leftMargin = dp(8)
+        t.layoutParams = lp
+        return t
+    }
+
+    private fun buildPanel() {
+        panel = LinearLayout(this)
+        panel.orientation = LinearLayout.VERTICAL
+        panel.visibility = View.GONE
+        panel.setPadding(dp(16), dp(6), dp(16), dp(2))
+
+        val head = LinearLayout(this)
+        head.orientation = LinearLayout.HORIZONTAL
+        head.gravity = Gravity.CENTER_VERTICAL
+        panelTitle = TextView(this)
+        panelTitle.setTextColor(0xFFBBBBBB.toInt())
+        panelTitle.textSize = 11f
+        head.addView(panelTitle, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        panelValue = TextView(this)
+        panelValue.setTextColor(Color.WHITE)
+        panelValue.textSize = 26f
+        panelValue.typeface = android.graphics.Typeface.DEFAULT_BOLD
+        panelValue.setPadding(dp(12), dp(2), dp(12), dp(2))
+        panelValue.setOnClickListener { panelValueTap?.invoke() }
+        head.addView(panelValue)
+        panelPills = LinearLayout(this)
+        panelPills.orientation = LinearLayout.HORIZONTAL
+        panelPills.gravity = Gravity.END or Gravity.CENTER_VERTICAL
+        head.addView(panelPills, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        panel.addView(head)
+
+        val line = LinearLayout(this)
+        line.orientation = LinearLayout.HORIZONTAL
+        line.gravity = Gravity.CENTER_VERTICAL
+        ruler = RulerView(this)
+        val minus = pill("−") { ruler.nudge(-1) }
+        val plus = pill("+") { ruler.nudge(1) }
+        (minus.layoutParams as LinearLayout.LayoutParams).leftMargin = 0
+        minus.textSize = 22f
+        plus.textSize = 22f
+        line.addView(minus)
+        line.addView(ruler, LinearLayout.LayoutParams(0, dp(78), 1f))
+        line.addView(plus)
+        panel.addView(line)
+    }
+
+    private fun closePanel() {
+        panel.visibility = View.GONE
+        panelKey = null
+        btns.forEach { it.mark(false) }
+    }
+
+    private fun openPanel(
+        key: String, title: String, steps: Int, index: Int, tickDp: Int,
+        major: (Int) -> Boolean, tickLabel: (Int) -> String, header: () -> String,
+        pills: List<Pair<String, () -> Int?>>, valueTap: (() -> Unit)? = null,
+        onIndex: (Int) -> Unit
+    ) {
+        if (panelKey == key) { closePanel(); return }
+        panelKey = key
+        panelTitle.text = title
+        panelValueTap = valueTap
+        ruler.tickPx = tickDp * resources.displayMetrics.density
+        ruler.isMajor = major
+        ruler.label = tickLabel
+        ruler.setup(steps, index)
+        panelValue.text = header()
+        ruler.onChange = { i -> onIndex(i); panelValue.text = header() }
+        panelPills.removeAllViews()
+        for ((name, act) in pills) {
+            panelPills.addView(pill(name) {
+                val r = act()
+                if (r != null) ruler.setIndexSilently(r)
+                panelValue.text = header()
+            })
+        }
+        panelPills.addView(pill("✕") { closePanel() })
+        panel.visibility = View.VISIBLE
+        btns.forEach { it.mark(it.label == key) }
+    }
+
+    /** Whole-number setting (delay, frames, gap) as a ruler; tap the big number to type an exact value. */
+    private fun intPanel(
+        key: String, title: String, max: Int, majorEvery: Int, zeroLabel: String?, unit: String,
+        get: () -> Int, set: (Int) -> Unit
+    ) {
+        val zl = zeroLabel
+        fun head(): String { val v = get(); return if (v == 0 && zl != null) zl else "$v$unit" }
+        openPanel(key, title, max + 1, get().coerceIn(0, max), 10,
+            { it % majorEvery == 0 }, { if (it == 0 && zl != null) zl else it.toString() }, { head() },
+            emptyList(),
+            {
+                pickNumber(title, get(), "Type an exact value") {
+                    set(it)
+                    afterChange()
+                    panelKey = null
+                    intPanel(key, title, max, majorEvery, zeroLabel, unit, get, set)
+                }
+            }
+        ) { set(it); afterChange() }
     }
 
     private fun afterChange() {
@@ -428,24 +658,32 @@ class MainActivity : Activity() {
         (shutterInner.background as GradientDrawable).setColor(if (running) 0xFFCC2222.toInt() else 0xFF0A0A1E.toInt())
     }
 
-    @Suppress("DEPRECATION")
+    /**
+     * The camera system already rotates the picture upright for the device's NATURAL orientation
+     * (phones: portrait, many tablets: landscape) and TextureView stretches it over the whole view.
+     * So: undo the stretch using the natural-orientation aspect, counter-rotate by the current
+     * display rotation, then fit inside the view with black bars. Same method as CacheCam.
+     */
     private fun fitPreview() {
         val ps = previewSize ?: return
-        val pw = root.width
-        val ph = root.height
-        if (pw == 0 || ph == 0) return
-        val ar = ps.width.toFloat() / ps.height
-        var w = pw
-        var h = (pw / ar).toInt()
-        if (h > ph) { h = ph; w = (ph * ar).toInt() }
-        val lp = textureView.layoutParams as FrameLayout.LayoutParams
-        if (lp.width != w || lp.height != h) {
-            lp.width = w
-            lp.height = h
-            textureView.layoutParams = lp
-        }
+        val vw = textureView.width.toFloat()
+        val vh = textureView.height.toFloat()
+        if (vw == 0f || vh == 0f) return
+        val sensor = chars?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        val portraitContent = sensor % 180 != 0
+        val cw = if (portraitContent) ps.height.toFloat() else ps.width.toFloat()
+        val ch = if (portraitContent) ps.width.toFloat() else ps.height.toFloat()
+        val rot = -displayDegrees()
+        val cx = vw / 2f
+        val cy = vh / 2f
         val m = Matrix()
-        if (windowManager.defaultDisplay.rotation == Surface.ROTATION_270) m.postRotate(180f, w / 2f, h / 2f)
+        m.postScale(cw / vw, ch / vh, cx, cy)
+        m.postRotate(rot.toFloat(), cx, cy)
+        val sideways = ((rot % 180) + 180) % 180 != 0
+        val rw = if (sideways) ch else cw
+        val rh = if (sideways) cw else ch
+        val sc = minOf(vw / rw, vh / rh)
+        m.postScale(sc, sc, cx, cy)
         textureView.setTransform(m)
     }
 
@@ -501,9 +739,11 @@ class MainActivity : Activity() {
         val pm = PopupMenu(this, anchor)
         pm.menu.add(0, 1, 0, "Camera info")
         pm.menu.add(0, 2, 1, "Session name: $sessionName")
+        pm.menu.add(0, 3, 2, "Interface settings")
         pm.setOnMenuItemClickListener {
             when (it.itemId) {
                 1 -> showCameraInfo()
+                3 -> showUiSettings()
                 2 -> {
                     val et = EditText(this)
                     et.setText(sessionName)
@@ -535,6 +775,7 @@ class MainActivity : Activity() {
         if (running) { toast("Stop the sequence first"); return }
         if (lenses.isEmpty()) { toast("No cameras found"); return }
         pickList("Lens", lenses.map { it.detail }, lensIndex) {
+            closePanel()
             lensIndex = it
             savePrefs()
             refreshAll()
@@ -574,25 +815,45 @@ class MainActivity : Activity() {
         return out
     }
 
-    private fun onShutter() {
-        val opts = shutterOptions()
-        val labels = listOf("Auto") + opts.map { fmtShutter(it) }
-        val sel = if (expNs <= 0) 0 else (opts.indexOfFirst { abs(it - expNs) < expNs * 0.05 } + 1).coerceAtLeast(0)
-        pickList("Shutter", labels, sel) {
-            expNs = if (it == 0) 0L else opts[it - 1]
-            afterChange()
+    /** Shutter list with two extra 1/3-stop steps between each pair (major ticks = the named speeds). */
+    private fun shutterFine(): List<Pair<Long, Boolean>> {
+        val base = shutterOptions()
+        val out = ArrayList<Pair<Long, Boolean>>()
+        for (k in base.indices) {
+            out.add(base[k] to true)
+            if (k + 1 < base.size) {
+                val lo = base[k].toDouble()
+                val hi = base[k + 1].toDouble()
+                out.add(Math.round(lo * Math.pow(hi / lo, 1.0 / 3.0)) to false)
+                out.add(Math.round(lo * Math.pow(hi / lo, 2.0 / 3.0)) to false)
+            }
         }
+        return out
+    }
+
+    private fun onShutter() {
+        val opts = shutterFine()
+        if (opts.isEmpty()) return
+        val cur = if (expNs <= 0) 1_000_000_000L else expNs
+        val idx = opts.indices.minByOrNull { abs(Math.log(opts[it].first.toDouble() / cur)) } ?: 0
+        openPanel("SHUTTER", "SHUTTER", opts.size, idx, 22,
+            { opts[it].second }, { fmtShutter(opts[it].first) },
+            { if (expNs <= 0) "Auto" else fmtShutter(expNs) },
+            listOf<Pair<String, () -> Int?>>("Auto" to { expNs = 0L; afterChange(); null })
+        ) { expNs = opts[it].first; afterChange() }
     }
 
     private fun onIso() {
         val r = chars?.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE) ?: Range(50, 3200)
-        val base = listOf(50, 100, 200, 400, 800, 1600, 3200, 6400, 12800, 25600)
-        val opts = base.filter { it >= r.lower && it <= r.upper }.toMutableList()
-        if (opts.isEmpty() || opts.last() < r.upper * 0.8) opts.add(r.upper)
-        pickList("ISO (ignored when shutter is Auto)", opts.map { it.toString() }, opts.indexOf(iso)) {
-            iso = opts[it]
-            afterChange()
-        }
+        val list = ArrayList<Int>()
+        var v = r.lower.toDouble()
+        while (v < r.upper) { list.add(v.roundToInt()); v *= Math.pow(2.0, 1.0 / 3.0) }
+        list.add(r.upper)
+        val vals = list.distinct()
+        val idx = vals.indices.minByOrNull { abs(vals[it] - iso) } ?: 0
+        openPanel("ISO", "ISO (IGNORED WHEN SHUTTER IS AUTO)", vals.size, idx, 22,
+            { it % 3 == 0 }, { vals[it].toString() }, { iso.toString() }, emptyList()
+        ) { iso = vals[it]; afterChange() }
     }
 
     private fun onWb() {
@@ -605,23 +866,30 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun focusText(d: Float) =
+        if (d < 0.05f) "∞" else String.format(Locale.US, "%.2f D  (~%.0f cm)", d, 100f / d)
+
     private fun onFocus() {
         val minF = chars?.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
         if (minF <= 0f) { toast("This lens has fixed focus"); return }
-        pickSlider(
-            "Focus (left = infinity)", 0f, minF, if (focusAuto) 0f else focusDiopter,
-            { if (it < 0.05f) "∞" else String.format(Locale.US, "%.2f D  (~%.0f cm)", it, 100f / it) },
-            "Auto", { focusAuto = true; afterChange() }
-        ) { focusAuto = false; focusDiopter = it; afterChange() }
+        val n = 200
+        val idx = if (focusAuto) 0 else (focusDiopter / minF * n).roundToInt().coerceIn(0, n)
+        openPanel("FOCUS", "FOCUS (LEFT = INFINITY)", n + 1, idx, 7,
+            { it % 20 == 0 }, { if (it == 0) "∞" else String.format(Locale.US, "%.1f", minF * it / n) },
+            { if (focusAuto) "Auto" else focusText(focusDiopter) },
+            listOf<Pair<String, () -> Int?>>("Auto" to { focusAuto = true; afterChange(); null })
+        ) { focusAuto = false; focusDiopter = minF * it / n; afterChange() }
     }
 
     private fun onZoom() {
         val maxZ = minOf(chars?.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 4f, 10f)
-        pickSlider(
-            "Digital zoom", 1f, maxZ, zoom.coerceIn(1f, maxZ),
-            { String.format(Locale.US, "%.1fx", it) },
-            "Reset", { zoom = 1f; afterChange() }
-        ) { zoom = it; afterChange() }
+        val n = ((maxZ - 1f) * 10f).roundToInt().coerceAtLeast(1)
+        val idx = ((zoom - 1f) * 10f).roundToInt().coerceIn(0, n)
+        openPanel("ZOOM", "DIGITAL ZOOM", n + 1, idx, 14,
+            { it % 5 == 0 }, { String.format(Locale.US, "%.1fx", 1f + it / 10f) },
+            { String.format(Locale.US, "%.1fx", zoom) },
+            listOf<Pair<String, () -> Int?>>("Reset" to { zoom = 1f; afterChange(); 0 })
+        ) { zoom = 1f + it / 10f; afterChange() }
     }
 
     // ---------- formatting ----------
